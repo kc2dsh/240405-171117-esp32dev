@@ -1,0 +1,384 @@
+#include <stdlib.h>
+#include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
+#include <ArduinoOTA.h>
+
+#include <PubSubClient.h>
+
+#include "SPI.h"
+#include <XPT2046_Touchscreen.h>
+
+#include "TFT_eSPI.h"
+
+#include "Free_Fonts.h" // Include the header file attached to this sketch
+
+// ----------------------------
+// Touch Screen pins
+// ----------------------------
+
+// The CYD touch uses some non default
+// SPI pins
+
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+// ----------------------------
+
+SPIClass mySpi = SPIClass(VSPI);
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+
+//#define pdMS_TO_TICKS( xTimeInMs ) ( ( ( TickType_t ) ( xTimeInMs ) * configTICK_RATE_HZ ) / ( TickType_t ) 1000 )
+
+#define CHIP "ESP32-CYD4"
+
+const char* mqtt_broker = "192.168.100.232";
+const int mqtt_port = 1883;
+
+const char *clientId = "ESP32-CYD4";
+const char* publish_topic = "tele/ESP32-CYD4/status";
+const char* subscribe_topic = "cmnd/ESP32-CYD4/#";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Use hardware SPI
+TFT_eSPI tft = TFT_eSPI();
+
+const char* ssid = "TP-Link_CB58";
+const char* password = "13157005";
+const char* ntpServer = "pool.ntp.org";
+
+const char compile_date[] = __DATE__ " " __TIME__;
+const char filename[] = __FILE__;
+
+time_t now;
+struct tm *tmInfo;
+struct tm info;
+struct tm infoUTC;
+
+char metricData[100]; // Placeholder for your sensor data
+char olddate[64];
+char oldtemp[64];
+//char tempbuffer[64];
+volatile long current_temp = 44;
+
+uint16_t txt_colour = TFT_YELLOW;
+
+unsigned long lastPublishTime = 0;
+const unsigned long publishInterval = 300000; // milliseconds (5 minutes)
+
+volatile int currentScreen = 1;
+
+// Function prototypes (declared before setup)
+void displayScreen1(void *pvParameters);
+//void displayScreen2(void *pvParameters);
+//void displayScreen3(void *pvParameters);
+void reconnectMQTT();
+
+//void receiveSubscribed();
+
+void setupScreen1(void) {
+
+  tft.begin();
+
+  tft.setRotation(3);
+  //tft.invertDisplay( true );
+  //tft.fillRect(0, 0, 320, 240, TFT_BLACK);
+  tft.fillScreen(TFT_BLACK);
+
+  
+  tft.setFreeFont(TT1);
+  tft.setCursor(0, 20);
+  tft.setTextColor(TFT_GREEN);
+  tft.print("Code: ");
+  tft.println(filename);
+  tft.println("");
+  tft.println(compile_date);
+  tft.setCursor(0,60);
+  tft.setFreeFont(FSS9);
+  tft.print("IP: ");
+  tft.println(WiFi.localIP());
+
+  tft.setTextColor(TFT_SKYBLUE);
+  tft.setFreeFont(FSSB12);
+  tft.setCursor(0,140);
+  tft.print("UTC");
+  tft.setCursor(0,195);
+  tft.print("NYC");
+
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  
+
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  mySpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(mySpi);
+  ts.setRotation(3);
+
+  ArduinoOTA.setHostname(CHIP);
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH)
+        type = "sketch";
+      else // U_SPIFFS
+        type = "filesystem";
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      Serial.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      Serial.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+
+  ArduinoOTA.begin();
+
+  configTzTime("EST5EDT4,M3.2.0/02:00:00,M10.5.0/02:00:00",ntpServer);
+  Serial.println("Waiting for time to be set...");
+  while (!time(nullptr)) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("Time set!");
+
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(receiveSubscribed);
+
+  setupScreen1();
+  xTaskCreate(displayScreen1, "Display Screen 1", 10240, NULL, 1, NULL);
+
+}
+
+void displayScreen1(void *pvParameters) {
+  (void)pvParameters;
+
+  char tbuffer[64];
+  int xpos =  10;
+  int ypos = 50;
+  TFT_eSprite img=TFT_eSprite(&tft);
+  TFT_eSprite dateSprite=TFT_eSprite(&tft);
+  TFT_eSprite tempSprite=TFT_eSprite(&tft);
+
+  int sprites_created = 0;
+
+Serial.println("132");
+
+  if (!sprites_created) {
+     img.createSprite(260,120);
+     img.fillSprite(TFT_BLACK);
+     dateSprite.createSprite(160,40);
+     dateSprite.fillSprite(TFT_BLACK);
+     tempSprite.createSprite(60,40);
+     tempSprite.fillSprite(TFT_BLACK);
+     sprites_created = 1;
+  }
+
+  while(true) {
+    
+     img.setTextColor(txt_colour);
+     img.setCursor(xpos, ypos);  
+     //tft.setFreeFont(FSSB24);       // Select Free Serif 24 point font
+     img.setFreeFont(NEW48);       // Select Free Serif 24 point font  
+     img.setTextDatum(TL_DATUM);
+     img.fillSprite(TFT_BLACK);
+     //img.drawRect(0,0,260,120,TFT_RED);
+   
+     time(&now);
+     tmInfo = gmtime_r(&now, &info);
+   
+     if (tmInfo == NULL) {
+       img.println("Failed to obtain time from NTP server");
+       return;
+     }
+   
+     strftime(tbuffer,63,"%H:%M:%S",&info);
+     //tft.print(asctime(&timeInfo));
+     img.print(tbuffer);
+   
+     tmInfo = localtime_r(&now, &infoUTC);
+     strftime(tbuffer,63,"%H:%M:%S",&infoUTC);
+     //tft.print(asctime(&timeInfo));
+     img.setCursor(xpos, ypos+56);  
+   
+     img.print(tbuffer);
+   
+     img.pushSprite(60,100,TFT_TRANSPARENT);
+   
+  
+     strftime(tbuffer,63,"%a %b %d",&info);
+
+     if ( strcmp(olddate,tbuffer)){  //If we have new data, update the sprite
+        dateSprite.fillSprite(TFT_BLACK);
+        dateSprite.setTextColor(TFT_SKYBLUE);
+        dateSprite.setFreeFont(FSSB12);
+        dateSprite.setCursor(2,30);
+        dateSprite.print(tbuffer);
+        dateSprite.pushSprite(100,68,TFT_TRANSPARENT);
+        strcpy(olddate,tbuffer);
+     }
+   
+     snprintf(tbuffer,63,"%ld",current_temp);
+   
+     if ( strcmp(oldtemp,tbuffer)){  //If we have new data, update the sprite
+        tempSprite.fillSprite(TFT_BLACK);
+        if ( current_temp < 32) {
+           tempSprite.setTextColor(TFT_SKYBLUE);
+        }
+        else if ( current_temp >= 32 && current_temp < 80) {
+           tempSprite.setTextColor(TFT_OLIVE);
+        }
+        else {
+           tempSprite.setTextColor(TFT_ORANGE);
+        }
+        tempSprite.setFreeFont(FSSB24);
+        tempSprite.setCursor(0,34);
+        tempSprite.print(tbuffer);
+        tempSprite.pushSprite(240,30,TFT_TRANSPARENT);
+        strcpy(oldtemp,tbuffer);
+     }
+     
+     vTaskDelay(1000 / portTICK_PERIOD_MS);
+     
+
+  }
+}
+
+void loop() {
+
+  ArduinoOTA.handle();
+
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  if (ts.tirqTouched() && ts.touched()) {
+    TS_Point p = ts.getPoint();
+    if ( txt_colour == TFT_YELLOW) {
+      txt_colour = TFT_GREEN;
+    }
+    else {
+      txt_colour = TFT_YELLOW;
+    }
+    //printTouchToSerial(p);
+    //printTouchToDisplay(p);
+    //delay(500);
+  }
+
+  if (millis() - lastPublishTime >= publishInterval) {
+    char tbuffer[64];
+    time(&now);
+    tmInfo = localtime_r(&now, &info);
+  
+    strftime(tbuffer,63,"{\"payload\": \"%Y%m%d %H:%M:%S\"}",&info);
+    
+    snprintf(metricData,sizeof(metricData),"%s",tbuffer);
+    // Prepare your sensor data (e.g., temperature reading) in metricData
+    // Example:
+    // float temperature = readSensorData();
+    // snprintf(metricData, sizeof(metricData), "{\"temperature\": %.2f}", temperature);
+    publishMetricData();
+    lastPublishTime = millis();
+  }
+}
+
+void reconnectMQTT() {
+  Serial.print("Reconnecting to MQTT Broker: ");
+  Serial.println(mqtt_broker);
+  while (!client.connected()) {
+    if (client.connect(clientId)) {
+      /*
+      char tbuffer[64];
+        time(&now);
+        tmInfo = localtime_r(&now, &info);
+  
+      strftime(tbuffer,63,"Up and running at %H:%M:%S",&info);
+      */
+      Serial.println("Connected to MQTT Broker");
+      client.subscribe(subscribe_topic);
+      //client.publish(publish_topic,tbuffer);
+
+    } else {
+      Serial.print("Failed with state: ");
+      Serial.print(client.state());
+      delay(1000);
+    }
+  }
+}
+
+void publishMetricData() {
+  client.publish(publish_topic, metricData);
+  Serial.print("Published data: ");
+  Serial.println(metricData);
+}
+
+void receiveSubscribed(char* topic, byte* payload, unsigned int length) {
+  char *end;
+  char tempbuffer[64];
+
+  Serial.print("Message arrived, topic = \"");
+  Serial.print(topic);
+  Serial.println("\"");
+  Serial.print("payload=");
+  for (int i = 0; i < length; i++) {
+    tempbuffer[i] = payload[i];
+    Serial.print((char)payload[i]);
+  }
+  tempbuffer[length] = '\0';
+  current_temp = strtol(tempbuffer,&end,10);
+  Serial.println();
+
+  // Handle received messages based on the topic
+
+  // Example: control LED based on command
+  if (strcmp(topic, subscribe_topic) == 0) {
+    String message = "";
+    for (int i = 0; i < length; i++) {
+      message += (char)payload[i];
+    }
+    Serial.print("Received: ");
+    Serial.print(message);
+/*
+    if (message == "ON") {
+      // Turn on LED
+    } else if (message == "OFF") {
+      // Turn off LED
+    }
+*/
+  }
+}
+

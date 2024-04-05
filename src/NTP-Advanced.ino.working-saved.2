@@ -1,0 +1,209 @@
+#include <WiFi.h>
+#include <time.h>
+
+#include <PubSubClient.h>
+
+const char* mqtt_broker = "192.168.100.323";
+const int mqtt_port = 1883;
+
+const char* publish_topic = "tele/cyd/metric";
+const char* subscribe_topic = "cmnd/cyd/temperature";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+#include "SPI.h"
+#include "TFT_eSPI.h"
+
+#include "Free_Fonts.h" // Include the header file attached to this sketch
+
+// Use hardware SPI
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite img=TFT_eSprite(&tft);
+TFT_eSprite dateSprite=TFT_eSprite(&tft);
+TFT_eSprite tempSprite=TFT_eSprite(&tft);
+
+
+const char* ssid = "TP-Link_CB58";
+const char* password = "13157005";
+const char* ntpServer = "pool.ntp.org";
+
+const char compile_date[] = __DATE__ " " __TIME__;
+const char filename[] = __FILE__;
+
+time_t now;
+struct tm *tmInfo;
+struct tm info;
+struct tm infoUTC;
+
+char metricData[100]; // Placeholder for your sensor data
+char olddate[64];
+char oldtemp[64];
+float current_temp = 44.0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  client.setServer(mqtt_broker, mqtt_port);
+
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  configTzTime("EST5EDT4,M3.2.0/02:00:00,M10.5.0/02:00:00",ntpServer);
+  Serial.println("Waiting for time to be set...");
+  while (!time(nullptr)) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("Time set!");
+
+  tft.begin();
+
+  tft.setRotation(3);
+  tft.invertDisplay( true );
+  //tft.fillRect(0, 0, 320, 240, TFT_BLACK);
+  tft.fillScreen(TFT_BLACK);
+
+  img.createSprite(260,120);
+  img.fillSprite(TFT_BLACK);
+  dateSprite.createSprite(160,40);
+  dateSprite.fillSprite(TFT_BLACK);
+  tempSprite.createSprite(100,40);
+  tempSprite.fillSprite(TFT_BLACK);
+  
+  tft.setFreeFont(TT1);
+  tft.setCursor(0, 20);
+  tft.setTextColor(TFT_GREEN);
+  tft.print("Code: ");
+  tft.println(filename);
+  tft.println("");
+  tft.println(compile_date);
+  tft.setCursor(0,60);
+  tft.setFreeFont(FSS9);
+  tft.print("IP: ");
+  tft.println(WiFi.localIP());
+
+  tft.setTextColor(TFT_SKYBLUE);
+  tft.setFreeFont(FSSB12);
+  tft.setCursor(0,140);
+  tft.print("UTC");
+  tft.setCursor(0,195);
+  tft.print("NYC");
+
+
+
+}
+
+void loop() {
+
+  char tbuffer[64];
+  int xpos =  10;
+  int ypos = 50;
+ 
+  img.setTextColor(TFT_YELLOW);
+  //img.setTextSize(2);
+  img.setCursor(xpos, ypos);  
+  //tft.setFreeFont(FSSB24);       // Select Free Serif 24 point font
+  img.setFreeFont(NEW48);       // Select Free Serif 24 point font
+  //tft.println();                // Move cursor down a line
+  //tft.print("Serif Bold 24pt"); // Print the font name onto the TFT screen
+  //img.setTextSize(4);
+
+img.setTextDatum(TL_DATUM);
+img.fillSprite(TFT_BLACK);
+//img.drawRect(0,0,260,120,TFT_RED);
+
+//img.drawRect(1,1,260,120,TFT_RED);
+//setenv("TZ", "EST5EDT4,M3.2.0/02:00:00,M10.5.0/02:00:00", 1);
+  //tzset();
+  
+  time(&now);
+  tmInfo = gmtime_r(&now, &info);
+
+  if (tmInfo == NULL) {
+    img.println("Failed to obtain time from NTP server");
+    return;
+  }
+
+  strftime(tbuffer,63,"%H:%M:%S",&info);
+  //tft.print(asctime(&timeInfo));
+  img.print(tbuffer);
+
+  tmInfo = localtime_r(&now, &infoUTC);
+  strftime(tbuffer,63,"%H:%M:%S",&infoUTC);
+  //tft.print(asctime(&timeInfo));
+  img.setCursor(xpos, ypos+56);  
+
+  img.print(tbuffer);
+
+  img.pushSprite(60,100,TFT_TRANSPARENT);
+
+  
+  strftime(tbuffer,63,"%a %b %d",&info);
+
+  if ( strcmp(olddate,tbuffer)){  //If we have new data, update the sprite
+     dateSprite.fillSprite(TFT_BLACK);
+     dateSprite.setTextColor(TFT_SKYBLUE);
+     dateSprite.setFreeFont(FSSB12);
+     dateSprite.setCursor(2,30);
+     dateSprite.print(tbuffer);
+     dateSprite.pushSprite(100,68,TFT_TRANSPARENT);
+     strcpy(olddate,tbuffer);
+  }
+
+  snprintf(tbuffer,63,"%.1f",current_temp);
+
+  if ( strcmp(oldtemp,tbuffer)){  //If we have new data, update the sprite
+     tempSprite.fillSprite(TFT_BLACK);
+     if ( current_temp < 32) {
+        tempSprite.setTextColor(TFT_SKYBLUE);
+     }
+     else if ( current_temp >= 32 && current_temp < 80) {
+        tempSprite.setTextColor(TFT_OLIVE);
+     }
+     else {
+        tempSprite.setTextColor(TFT_ORANGE);
+     }
+     tempSprite.setFreeFont(FSSB24);
+     tempSprite.setCursor(0,34);
+     tempSprite.print(tbuffer);
+     tempSprite.pushSprite(200,30,TFT_TRANSPARENT);
+     strcpy(oldtemp,tbuffer);
+  }
+
+  delay(1000);
+}
+
+void reconnectMQTT() {
+  Serial.print("Reconnecting to MQTT Broker: ");
+  Serial.println(mqtt_broker);
+  while (!client.connected()) {
+    if (client.connect("ESP32Client")) {
+      Serial.println("Connected to MQTT Broker");
+      client.subscribe(subscribe_topic);
+    } else {
+      Serial.print("Failed with state: ");
+      Serial.print(client.state());
+      delay(1000);
+    }
+  }
+}
+
+void publishMetricData() {
+  client.publish(publish_topic, metricData);
+  Serial.print("Published data: ");
+  Serial.println(metricData);
+}
